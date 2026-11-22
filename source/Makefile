@@ -1,7 +1,14 @@
-.PHONY:all
-all:
-	g++ Main.cc -o Main -std=c++17 -g
-	g++ Client.cc -o Client -std=c++17
-.PHONY:clean
+CXXFLAGS = -std=c++17 -pthread -g
+
+.PHONY: all
+all: Main Client
+
+Main: Main.cc Server.hpp
+	g++ $(CXXFLAGS) Main.cc -o Main
+
+Client: Client.cc Server.hpp
+	g++ $(CXXFLAGS) Client.cc -o Client
+
+.PHONY: clean
 clean:
 	rm -rf Main Client

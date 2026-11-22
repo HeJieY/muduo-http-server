@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 #include <cstdint>
+#include <cstdlib>
 #include <cassert>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -71,9 +72,10 @@ enum ExitCode
         if (level >= LOG_LEVEL)                                        \
         {                                                              \
             time_t t = time(NULL);                                     \
-            struct tm *tm_info = localtime(&t);                        \
+            struct tm tm_info;                                         \
+            localtime_r(&t, &tm_info);                                 \
             char time_buf[9];                                          \
-            strftime(time_buf, sizeof(time_buf), "%H:%M:%S", tm_info); \
+            strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tm_info);\
             fprintf(stdout, "[%s] %s:%d " fmt "\n",                    \
                     time_buf, __FILE__, __LINE__, ##__VA_ARGS__);      \
         }                                                              \
@@ -146,8 +148,9 @@ public:
     // 子类指针访问父类时进行的是对象切片，不需要进行强转，这是安全的
     // 父类指针访问子类时:对于发生多态的函数不用强转，对于子类自己的函数则必须进行强转
     template<typename T>
-    T GetData()
+    T& GetData()
     {
+        assert(_content != nullptr);
         assert(typeid(T) == _content->GetType());
         return ((PlaceHolder<T>*)_content)->_data;
     }
@@ -213,25 +216,36 @@ public:
         _write_index = 0;
         return true;
     }
-    uint64_t GetReadableSize() { return _write_index - _read_index; }
-    // 这个是为了一行一行的提取HTTP协议内容
-    std::string ParseByCRLF()
+    uint64_t GetReadableSize() { assert(_write_index >= _read_index); return _write_index - _read_index; }
+    std::string GetLine() 
     {
-        auto it = std::find(GetReadPos(), GetWritePos(), '\n');
-        if (it != GetWritePos())
-        {
-            return std::string(GetReadPos(), it + 1); // 把\n也提取出来
-        }
-        else
+        char *pos = FindCRLF();
+        if (pos == NULL) 
         {
             return "";
         }
+        // +1是为了把换行字符也取出来。
+        // 这里只查看不移动读指针，统一由 GetLineAndPop 消费数据，
+        // 否则会出现 GetLine 和 GetLineAndPop 各移动一次、读指针越过写指针的问题。
+        return PeekAsString(pos - GetReadPos() + 1);
+    }
+    std::string GetLineAndPop() 
+    {
+        std::string str = GetLine();
+        UpdateReadPos(str.size());
+        return str;
+    }
+    // 这个是为了一行一行的提取HTTP协议内容
+    char *FindCRLF() 
+    {
+        char *res = (char*)memchr(GetReadPos(), '\n', GetReadableSize());
+        return res;
     }
     char *GetReadPos() { return GetBegin() + _read_index; }
     char *GetWritePos() { return GetBegin() + _write_index; }
     // 老师的项目中将char* 写成了void*，查询资料得知void*的加法是未定义的，g++编译器把其看成1，考虑到这些，我们用char*
-    void UpdateWritePos(uint64_t len) { _write_index += len; }
-    void UpdateReadPos(uint64_t len) { _read_index += len; }
+    void UpdateWritePos(uint64_t len) { assert(_write_index + len <= _capacity); _write_index += len; }
+    void UpdateReadPos(uint64_t len) { assert(_read_index + len <= _write_index); _read_index += len; }
     char *GetBegin() { return &(*_buffer.begin()); }
 private:
     uint64_t GetWriteTailMem() { return _capacity - _write_index; }
@@ -293,6 +307,9 @@ public:
 
     int CreateSocket()
     {
+        //重复调用 CreateSocket 时先关闭旧 fd，避免 fd 泄漏
+        if (_socketfd != -1)
+            Close();
         _socketfd = socket(AF_INET, SOCK_STREAM, 0);
         if (_socketfd < 0)
         {
@@ -481,6 +498,13 @@ public:
     int AcceptNewLink()
     {
         int newFd = accept(_socketfd, nullptr, nullptr);
+        if (newFd >= 0)
+        {
+            //accept 返回的新 fd 不会继承监听 fd 的 O_NONBLOCK，这里补上
+            int flags = fcntl(newFd, F_GETFL, 0);
+            if (flags >= 0)
+                fcntl(newFd, F_SETFL, flags | O_NONBLOCK);
+        }
         return newFd;
     }
 };
@@ -689,6 +713,7 @@ public:
             }
             else
             {
+                ERR_LOG("epoll_wait error: %s", strerror(errno));
                 exit(ExitCode::EPOLL_WAIT_ERROR);
             }
         }
@@ -806,6 +831,11 @@ private:
 
     void RefreshInLoop(uint64_t id)
     {
+        if (_capacity == 0)
+        {
+            ERR_LOG("TimeWheel capacity is zero");
+            return;
+        }
         auto it = _map.find(id);
         if(it != _map.end())
         {
@@ -926,8 +956,13 @@ public:
     //tick增加1s,并且处理到时间了的任务
     void TickMove()
     {
-        _ticks = (_ticks+1) % _capacity;
-        _tasks[_ticks].clear();
+        if (_capacity == 0)
+            return;
+        _ticks = static_cast<uint32_t>((_ticks + 1) % _capacity);
+        //先把到期任务换出来，再让它们析构；这样死亡回调里再 AddTask
+        //也不会在同一个 vector 的 clear() 过程中修改它。
+        std::vector<STaskPtr> expired;
+        expired.swap(_tasks[_ticks]);
     }
     void CancelTimerTask(uint64_t id);
     //这个接口不是线程安全的因此我们规定他只能是只读操作
@@ -1113,7 +1148,7 @@ private:
     //关闭该链接的接口
 
     //绑定到Channel中用于处理回调响应:
-
+    
     void HandleRead()
     {
         char buffer[65536];
@@ -1191,6 +1226,9 @@ private:
 
     void ShutdownInLoop()
     {
+        //避免重复 Shutdown / 释放后再次进入
+        if (_status == DISCONNECTED || _status == DISCONNECTING)
+            return;
         _status = DISCONNECTING;
         //先判断buffer还有没有要处理的数据
         if(_inBuffer.GetReadableSize() > 0)
@@ -1253,7 +1291,7 @@ private:
         if (_serverCloseCb) _serverCloseCb(self);
     }
 public:
-
+    
     void SetServerCloseCallBack(CloseCallBack serverCb)
     {
         _serverCloseCb = serverCb;
@@ -1309,7 +1347,10 @@ public:
     //指的是将连接置于待关闭状态
     void Shutdown()
     {
-        _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop,this));
+        //不能使用 RunInLoop：在 IO 线程里它会立即执行 ShutdownInLoop，
+        //而 ShutdownInLoop 可能再次回调 _messageCb，导致 OnMessage 递归。
+        auto self = shared_from_this();
+        _loop->QueueInLoop([self]() { self->ShutdownInLoop(); });
     }
     //设置该连接为非长连接并在sec秒后关闭
     void SetNoPersistentConnect(int sec)
@@ -1356,12 +1397,19 @@ public:
         while(true)
         {
             int fd = _socket.AcceptNewLink();
-            if(fd < 0 && (errno == EAGAIN))
+            if(fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             {
                 return;
             }
             if(fd < 0 && errno == EINTR) continue;
-            if(fd < 0) return;
+            if(fd < 0)
+            {
+                ERR_LOG("Accept error: %s", strerror(errno));
+                //fd 耗尽时避免 level-triggered epoll 空转
+                if(errno == EMFILE || errno == ENFILE)
+                    usleep(10000);
+                return;
+            }
             if(_acceptorCb) _acceptorCb(fd);//暂时定为业务处理函数
         }
 
@@ -1554,11 +1602,11 @@ public:
     }
 
     //capacity:timewheel的大小
-    TcpServer(const int capacity,const uint16_t port)
+    TcpServer(const int capacity,const uint16_t port,uint64_t timeout = 10)
         :_id(0)
         ,_nextTimerId(0x8000000000000000ULL)
         ,_port(port)
-        ,_timeout(10)
+        ,_timeout(timeout)
         ,_enable_inactive_release(false)
         ,_baseLoop(capacity)
         ,_acceptor(&_baseLoop,_port)

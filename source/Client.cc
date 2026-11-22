@@ -12,7 +12,6 @@ int main()
 {
     signal(SIGPIPE, SIG_IGN);
     Socket client;
-    client.CreateSocket();
     client.CreateClientConnect("127.0.0.1", 8081);
     std::string buffer;
     
