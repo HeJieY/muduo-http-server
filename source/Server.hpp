@@ -500,7 +500,7 @@ public:
         int newFd = accept(_socketfd, nullptr, nullptr);
         if (newFd >= 0)
         {
-            //accept 返回的新 fd 不会继承监听 fd 的 O_NONBLOCK，这里补上
+            //accept 返回的新 fd 不会继承监听 fd 的 O_NONBLOCK
             int flags = fcntl(newFd, F_GETFL, 0);
             if (flags >= 0)
                 fcntl(newFd, F_SETFL, flags | O_NONBLOCK);
