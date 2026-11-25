@@ -893,7 +893,7 @@ public:
         {
             case RECV_HTTP_LINE:
                 RecvHttpLine(buf);
-                [[fallthrough]];
+                [[fallthrough]];//C++17 的属性，表示故意贯穿到下一个 case，编译器不要报“缺少 break”警告。意思是：首行解析完，紧接着就进入头部解析，不用等下一次循环
             case RECV_HTTP_HEAD:
                 RecvHttpHead(buf);
                 [[fallthrough]];
@@ -901,7 +901,7 @@ public:
                 RecvHttpBody(buf);
                 break;
             case RECV_HTTP_ERROR:
-            case RECV_HTTP_OVER:
+            case RECV_HTTP_OVER://防止报告警告
                 break;
         }
             return;
